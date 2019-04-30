@@ -1736,7 +1736,7 @@ int dquot_alloc_inode(struct inode *inode)
 					continue;
 				/* Back out changes we already did */
 				spin_lock(&dquots[cnt]->dq_dqb_lock);
-				dquots[cnt]->dq_dqb.dqb_curinodes--;
+				dquot_decr_inodes(dquots[cnt], 1);
 				spin_unlock(&dquots[cnt]->dq_dqb_lock);
 			}
 			goto warn_put_all;
