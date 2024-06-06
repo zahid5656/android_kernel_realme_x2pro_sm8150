@@ -1,1 +1,0 @@
-# android_kernel_realme_x2pro_sm8150
