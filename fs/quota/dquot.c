@@ -917,15 +917,14 @@ out:
 }
 EXPORT_SYMBOL(dqget);
 
-static inline struct dquot __rcu **i_dquot(struct inode *inode)
+static inline struct dquot **i_dquot(struct inode *inode)
 {
-	/* Force __rcu for now until filesystems are fixed */
-	return (struct dquot __rcu **)inode->i_sb->s_op->get_dquots(inode);
+	return inode->i_sb->s_op->get_dquots(inode);
 }
 
 static int dqinit_needed(struct inode *inode, int type)
 {
-	struct dquot __rcu * const *dquots;
+	struct dquot * const *dquots;
 	int cnt;
 
 	if (IS_NOQUOTA(inode))
@@ -998,7 +997,59 @@ out:
 	return err;
 }
 
-static void remove_dquot_ref(struct super_block *sb, int type)
+/*
+ * Remove references to dquots from inode and add dquot to list for freeing
+ * if we have the last reference to dquot
+ */
+static void remove_inode_dquot_ref(struct inode *inode, int type,
+				   struct list_head *tofree_head)
+{
+	struct dquot **dquots = i_dquot(inode);
+	struct dquot *dquot = dquots[type];
+
+	if (!dquot)
+		return;
+
+	dquots[type] = NULL;
+	if (list_empty(&dquot->dq_free)) {
+		/*
+		 * The inode still has reference to dquot so it can't be in the
+		 * free list
+		 */
+		spin_lock(&dq_list_lock);
+		list_add(&dquot->dq_free, tofree_head);
+		spin_unlock(&dq_list_lock);
+	} else {
+		/*
+		 * Dquot is already in a list to put so we won't drop the last
+		 * reference here.
+		 */
+		dqput(dquot);
+	}
+}
+
+/*
+ * Free list of dquots
+ * Dquots are removed from inodes and no new references can be got so we are
+ * the only ones holding reference
+ */
+static void put_dquot_list(struct list_head *tofree_head)
+{
+	struct list_head *act_head;
+	struct dquot *dquot;
+
+	act_head = tofree_head->next;
+	while (act_head != tofree_head) {
+		dquot = list_entry(act_head, struct dquot, dq_free);
+		act_head = act_head->next;
+		/* Remove dquot from the list so we won't have problems... */
+		list_del_init(&dquot->dq_free);
+		dqput(dquot);
+	}
+}
+
+static void remove_dquot_ref(struct super_block *sb, int type,
+		struct list_head *tofree_head)
 {
 	struct inode *inode;
 	int reserved = 0;
@@ -1032,8 +1083,13 @@ static void remove_dquot_ref(struct super_block *sb, int type)
 /* Gather all references from inodes and drop them */
 static void drop_dquot_ref(struct super_block *sb, int type)
 {
-	if (sb->dq_op)
-		remove_dquot_ref(sb, type);
+	LIST_HEAD(tofree_head);
+
+	if (sb->dq_op) {
+		remove_dquot_ref(sb, type, &tofree_head);
+		synchronize_srcu(&dquot_srcu);
+		put_dquot_list(&tofree_head);
+	}
 }
 
 static inline
@@ -1366,8 +1422,7 @@ static int dquot_active(const struct inode *inode)
 static int __dquot_initialize(struct inode *inode, int type)
 {
 	int cnt, init_needed = 0;
-	struct dquot __rcu **dquots;
-	struct dquot *got[MAXQUOTAS] = {};
+	struct dquot **dquots, *got[MAXQUOTAS] = {};
 	struct super_block *sb = inode->i_sb;
 	qsize_t rsv;
 	int ret = 0;
@@ -1442,7 +1497,7 @@ static int __dquot_initialize(struct inode *inode, int type)
 		if (!got[cnt])
 			continue;
 		if (!dquots[cnt]) {
-			rcu_assign_pointer(dquots[cnt], got[cnt]);
+			dquots[cnt] = got[cnt];
 			got[cnt] = NULL;
 			/*
 			 * Make quota reservation system happy if someone
@@ -1450,16 +1505,12 @@ static int __dquot_initialize(struct inode *inode, int type)
 			 */
 			rsv = inode_get_rsv_space(inode);
 			if (unlikely(rsv)) {
-				struct dquot *dquot = srcu_dereference_check(
-					dquots[cnt], &dquot_srcu,
-					lockdep_is_held(&dq_data_lock));
-
 				spin_lock(&inode->i_lock);
 				/* Get reservation again under proper lock */
 				rsv = __inode_get_rsv_space(inode);
-				spin_lock(&dquot->dq_dqb_lock);
-				dquot->dq_dqb.dqb_rsvspace += rsv;
-				spin_unlock(&dquot->dq_dqb_lock);
+				spin_lock(&dquots[cnt]->dq_dqb_lock);
+				dquots[cnt]->dq_dqb.dqb_rsvspace += rsv;
+				spin_unlock(&dquots[cnt]->dq_dqb_lock);
 				spin_unlock(&inode->i_lock);
 			}
 		}
@@ -1481,7 +1532,7 @@ EXPORT_SYMBOL(dquot_initialize);
 
 bool dquot_initialize_needed(struct inode *inode)
 {
-	struct dquot __rcu **dquots;
+	struct dquot **dquots;
 	int i;
 
 	if (!dquot_active(inode))
@@ -1506,14 +1557,13 @@ EXPORT_SYMBOL(dquot_initialize_needed);
 static void __dquot_drop(struct inode *inode)
 {
 	int cnt;
-	struct dquot __rcu **dquots = i_dquot(inode);
+	struct dquot **dquots = i_dquot(inode);
 	struct dquot *put[MAXQUOTAS];
 
 	spin_lock(&dq_data_lock);
 	for (cnt = 0; cnt < MAXQUOTAS; cnt++) {
-		put[cnt] = srcu_dereference_check(dquots[cnt], &dquot_srcu,
-					lockdep_is_held(&dq_data_lock));
-		rcu_assign_pointer(dquots[cnt], NULL);
+		put[cnt] = dquots[cnt];
+		dquots[cnt] = NULL;
 	}
 	spin_unlock(&dq_data_lock);
 	dqput_all(put);
@@ -1521,7 +1571,7 @@ static void __dquot_drop(struct inode *inode)
 
 void dquot_drop(struct inode *inode)
 {
-	struct dquot __rcu * const *dquots;
+	struct dquot * const *dquots;
 	int cnt;
 
 	if (IS_NOQUOTA(inode))
@@ -1686,7 +1736,7 @@ int dquot_alloc_inode(struct inode *inode)
 					continue;
 				/* Back out changes we already did */
 				spin_lock(&dquots[cnt]->dq_dqb_lock);
-				dquot_decr_inodes(dquots[cnt], 1);
+				dquots[cnt]->dq_dqb.dqb_curinodes--;
 				spin_unlock(&dquots[cnt]->dq_dqb_lock);
 			}
 			goto warn_put_all;
@@ -1895,7 +1945,6 @@ int __dquot_transfer(struct inode *inode, struct dquot **transfer_to)
 	qsize_t cur_space;
 	qsize_t rsv_space = 0;
 	qsize_t inode_usage = 1;
-	struct dquot __rcu **dquots;
 	struct dquot *transfer_from[MAXQUOTAS] = {};
 	int cnt, ret = 0;
 	char is_valid[MAXQUOTAS] = {};
@@ -1928,7 +1977,6 @@ int __dquot_transfer(struct inode *inode, struct dquot **transfer_to)
 	}
 	cur_space = __inode_get_bytes(inode);
 	rsv_space = __inode_get_rsv_space(inode);
-	dquots = i_dquot(inode);
 	/*
 	 * Build the transfer_from list, check limits, and update usage in
 	 * the target structures.
@@ -1943,8 +1991,7 @@ int __dquot_transfer(struct inode *inode, struct dquot **transfer_to)
 		if (!sb_has_quota_active(inode->i_sb, cnt))
 			continue;
 		is_valid[cnt] = 1;
-		transfer_from[cnt] = srcu_dereference_check(dquots[cnt],
-				&dquot_srcu, lockdep_is_held(&dq_data_lock));
+		transfer_from[cnt] = i_dquot(inode)[cnt];
 		ret = dquot_add_inodes(transfer_to[cnt], inode_usage,
 				       &warn_to[cnt]);
 		if (ret)
@@ -1983,7 +2030,7 @@ int __dquot_transfer(struct inode *inode, struct dquot **transfer_to)
 						  rsv_space);
 			spin_unlock(&transfer_from[cnt]->dq_dqb_lock);
 		}
-		rcu_assign_pointer(dquots[cnt], transfer_to[cnt]);
+		i_dquot(inode)[cnt] = transfer_to[cnt];
 	}
 	spin_unlock(&inode->i_lock);
 	spin_unlock(&dq_data_lock);
